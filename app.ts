@@ -14,6 +14,7 @@ import {
   buildCommit,
   createRepo,
   deleteRepo,
+  findIssueByNumber,
   flattenTree,
   forgeIdent,
   getObject,
@@ -511,7 +512,7 @@ async function handleRest(ctx: Ctx, segments: string[]): Promise<boolean> {
       return false;
     }
     const num = Number(rest[1]);
-    const issue = repo.issues.find((i) => i.number === num);
+    const issue = findIssueByNumber(repo, num);
     if (rest.length === 2) {
       if (!issue) { notFound(res); return true; }
       if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return true; }
@@ -1031,8 +1032,13 @@ export function createApp(): Server {
           return;
         }
 
-        // Everything below needs the body up front.
-        const body = await readBody(req);
+        // Everything below needs the body up front — but a request whose
+        // headers frame no body (no transfer-encoding, no positive
+        // content-length) has none to wait for; skip the stream plumbing.
+        const lengthHeader = req.headers['content-length'];
+        const expectsBody = req.headers['transfer-encoding'] !== undefined
+          || (lengthHeader !== undefined && Number(lengthHeader) > 0);
+        const body = expectsBody ? await readBody(req) : Buffer.alloc(0);
         let json: Record<string, unknown> | null = null;
         let jsonError = false;
         if (body.length > 0 && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')) {

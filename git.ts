@@ -10,11 +10,11 @@ import {
   ZERO_OID,
   buildPack,
   collectReachable,
+  commitInfoOf,
   getObject,
   hasObject,
   ingestPack,
   isAncestor,
-  parseCommit,
   reachableSet,
   type RepoRec,
 } from './store.ts';
@@ -69,7 +69,7 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -104,18 +104,20 @@ function peel(oid: string): string {
 // info/refs advertisement
 // ---------------------------------------------------------------------------
 
+/** The protocol v2 advertisement never changes; build it once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done filter\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 export function handleInfoRefs(res: ServerResponse, repo: RepoRec, service: string, protocolV2: boolean): void {
   if (service === 'git-upload-pack') {
     if (protocolV2) {
-      const body = Buffer.concat([
-        pktLine('version 2\n'),
-        pktLine(`agent=${AGENT}\n`),
-        pktLine('ls-refs=unborn\n'),
-        pktLine('fetch=shallow wait-for-done filter\n'),
-        pktLine('object-format=sha1\n'),
-        PKT_FLUSH,
-      ]);
-      send(res, 200, 'application/x-git-upload-pack-advertisement', body);
+      send(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
       return;
     }
     const caps = 'multi_ack_detailed side-band-64k thin-pack ofs-delta deepen-since deepen-not agent=' + AGENT;
@@ -167,10 +169,10 @@ function sidebandPack(pack: Buffer): Buffer[] {
 
 /** Add a commit and its full tree closure (trees + blobs, no parents) to `into`. */
 function addCommitTrees(commitOid: string, into: Set<string>): void {
-  const commit = getObject(commitOid);
-  if (commit?.type !== 'commit') return;
+  const info = commitInfoOf(commitOid);
+  if (!info) return;
   into.add(commitOid);
-  const stack = [parseCommit(commit.payload).tree];
+  const stack = [info.tree];
   while (stack.length) {
     const oid = stack.pop() as string;
     if (into.has(oid)) continue;
@@ -223,37 +225,36 @@ function packFor(
     // not already held in full by the peer).
     const distance = new Map<string, number>();
     const queue: Array<{ oid: string; d: number }> = present.map((w) => ({ oid: w, d: 0 }));
+    let qHead = 0;
     const included = new Set<string>();
-    while (queue.length) {
-      const { oid, d } = queue.shift() as { oid: string; d: number };
+    while (qHead < queue.length) {
+      const { oid, d } = queue[qHead];
+      qHead += 1;
       if (distance.has(oid) && (distance.get(oid) as number) <= d) continue;
       distance.set(oid, d);
-      const obj = getObject(oid);
-      if (obj?.type !== 'commit') continue;
+      const info = commitInfoOf(oid);
+      if (!info) continue;
       if (exclude.has(oid)) {
         // A shallow have is the deepening frontier: walk through it to its
         // parents without packing it. A full have ends the walk — the peer
         // already holds everything below it.
         if (shallowHaves.has(oid)) {
-          for (const parent of parseCommit(obj.payload).parents) queue.push({ oid: parent, d: d + 1 });
+          for (const parent of info.parents) queue.push({ oid: parent, d: d + 1 });
         }
         continue;
       }
       if (d >= depth) continue;
       included.add(oid);
-      for (const parent of parseCommit(obj.payload).parents) queue.push({ oid: parent, d: d + 1 });
+      for (const parent of info.parents) queue.push({ oid: parent, d: d + 1 });
     }
     objectIds = new Set();
+    const closures = new Set<string>();
+    for (const commitOid of included) addCommitTrees(commitOid, closures);
+    for (const oid of closures) if (!exclude.has(oid)) objectIds.add(oid);
     for (const commitOid of included) {
-      const closure = new Set<string>();
-      addCommitTrees(commitOid, closure);
-      for (const oid of closure) if (!exclude.has(oid)) objectIds.add(oid);
-    }
-    for (const commitOid of included) {
-      const obj = getObject(commitOid);
-      if (obj?.type !== 'commit') continue;
-      const parents = parseCommit(obj.payload).parents;
-      if (parents.some((p) => !included.has(p) && !exclude.has(p))) shallow.push(commitOid);
+      const info = commitInfoOf(commitOid);
+      if (!info) continue;
+      if (info.parents.some((p) => !included.has(p) && !exclude.has(p))) shallow.push(commitOid);
     }
   }
   const objs = new Map<string, { type: string; payload: Buffer }>();

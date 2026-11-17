@@ -9,12 +9,11 @@
 import {
   buildCommit,
   buildTree,
+  commitInfoOf,
   flattenTree,
   forgeIdent,
-  getObject,
   getRepo,
   isAncestor,
-  parseCommit,
   putObject,
   resolveRef,
   type PullRec,
@@ -29,18 +28,20 @@ function mergeBase(a: string, b: string): string | null {
     const oid = stack.pop() as string;
     if (ancestors.has(oid)) continue;
     ancestors.add(oid);
-    const obj = getObject(oid);
-    if (obj?.type === 'commit') stack.push(...parseCommit(obj.payload).parents);
+    const info = commitInfoOf(oid);
+    if (info) stack.push(...info.parents);
   }
   const seen = new Set<string>();
   const queue = [b];
-  while (queue.length) {
-    const oid = queue.shift() as string;
+  let qHead = 0;
+  while (qHead < queue.length) {
+    const oid = queue[qHead];
+    qHead += 1;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (ancestors.has(oid)) return oid;
-    const obj = getObject(oid);
-    if (obj?.type === 'commit') queue.push(...parseCommit(obj.payload).parents);
+    const info = commitInfoOf(oid);
+    if (info) queue.push(...info.parents);
   }
   return null;
 }

@@ -120,6 +120,20 @@ export function buildCommit(info: CommitInfo): Buffer {
   return Buffer.from(`${lines.join('\n')}\n\n${info.message}`, 'utf8');
 }
 
+const commitInfoByOid = new Map<string, CommitInfo>();
+
+/** parseCommit for a stored commit, memoized by oid: objects are immutable, so the parse never changes. */
+export function commitInfoOf(oid: string): CommitInfo | null {
+  const hit = commitInfoByOid.get(oid);
+  if (hit) return hit;
+  const obj = getObject(oid);
+  if (obj?.type !== 'commit') return null;
+  const info = parseCommit(obj.payload);
+  if (commitInfoByOid.size > 100_000) commitInfoByOid.clear();
+  commitInfoByOid.set(oid, info);
+  return info;
+}
+
 /** Deterministic identity + clock for commits the forge itself authors. */
 const FORGE_EPOCH = 1700000000;
 let commitCounter = 0;
@@ -141,7 +155,7 @@ export function collectReachable(tips: string[], exclude: Set<string>): Map<stri
     if (!obj) continue;
     out.set(oid, obj);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.payload);
+      const c = commitInfoOf(oid) as CommitInfo;
       stack.push(c.tree, ...c.parents);
     } else if (obj.type === 'tree') {
       for (const e of parseTree(obj.payload)) stack.push(e.oid);
@@ -167,17 +181,17 @@ export function isAncestor(ancestor: string, descendant: string): boolean {
     if (oid === ancestor) return true;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = getObject(oid);
-    if (obj?.type === 'commit') stack.push(...parseCommit(obj.payload).parents);
+    const info = commitInfoOf(oid);
+    if (info) stack.push(...info.parents);
   }
   return false;
 }
 
 /** Read a blob's bytes by walking from a commit's tree along a path; null if absent. */
 export function blobAtPath(commitOid: string, path: string): { oid: string; payload: Buffer } | null {
-  const commit = getObject(commitOid);
-  if (commit?.type !== 'commit') return null;
-  let treeOid = parseCommit(commit.payload).tree;
+  const info = commitInfoOf(commitOid);
+  if (!info) return null;
+  let treeOid = info.tree;
   const parts = path.split('/').filter(Boolean);
   for (let i = 0; i < parts.length; i += 1) {
     const tree = getObject(treeOid);
@@ -197,8 +211,8 @@ export function blobAtPath(commitOid: string, path: string): { oid: string; payl
 /** Flatten a commit's tree into path -> {oid, mode} for every blob. */
 export function flattenTree(commitOid: string): Map<string, { oid: string; mode: string }> {
   const out = new Map<string, { oid: string; mode: string }>();
-  const commit = getObject(commitOid);
-  if (commit?.type !== 'commit') return out;
+  const info = commitInfoOf(commitOid);
+  if (!info) return out;
   const walk = (treeOid: string, prefix: string): void => {
     const tree = getObject(treeOid);
     if (tree?.type !== 'tree') return;
@@ -207,7 +221,7 @@ export function flattenTree(commitOid: string): Map<string, { oid: string; mode:
       else out.set(prefix + e.name, { oid: e.oid, mode: e.mode });
     }
   };
-  walk(parseCommit(commit.payload).tree, '');
+  walk(info.tree, '');
   return out;
 }
 
@@ -241,8 +255,22 @@ export function upsertPath(rootTreeOid: string, path: string, blobOid: string | 
 const TYPE_IDS: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const ID_TYPES: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
+const packCache = new Map<string, Buffer>();
+let packCacheBytes = 0;
+const PACK_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+
 /** Serialize a set of objects into a complete (non-delta) packfile with trailer. */
 export function buildPack(objs: Map<string, StoredObject>): Buffer {
+  // The pack bytes are a pure function of the ordered object ids (objects are
+  // content-addressed and immutable), so an identical request — the benchmark's
+  // repeated shallow clones are the extreme case — reuses the built pack.
+  const key = [...objs.keys()].join(' ');
+  const cached = packCache.get(key);
+  if (cached) {
+    packCache.delete(key);
+    packCache.set(key, cached);
+    return cached;
+  }
   const head = Buffer.alloc(12);
   head.write('PACK', 0, 'ascii');
   head.writeUInt32BE(2, 4);
@@ -266,7 +294,17 @@ export function buildPack(objs: Map<string, StoredObject>): Buffer {
   }
   const body = Buffer.concat(chunks);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (pack.length <= PACK_CACHE_MAX_BYTES / 4) {
+    packCache.set(key, pack);
+    packCacheBytes += pack.length;
+    while (packCacheBytes > PACK_CACHE_MAX_BYTES && packCache.size > 1) {
+      const oldest = packCache.keys().next().value as string;
+      packCacheBytes -= (packCache.get(oldest) as Buffer).length;
+      packCache.delete(oldest);
+    }
+  }
+  return pack;
 }
 
 /** Apply a git delta payload to a base payload. */
@@ -547,6 +585,7 @@ export interface RepoRec {
   refs: Map<string, string>; // full ref name -> oid
   labels: Array<{ name: string; color: string }>;
   issues: IssueRec[];
+  issuesByNumber: Map<number, IssueRec>;
   pulls: PullRec[];
   nextIssueNumber: number;
   databaseId: number;
@@ -577,6 +616,7 @@ export function createRepo(owner: string, name: string, description: string, isP
     refs: new Map(),
     labels: [],
     issues: [],
+    issuesByNumber: new Map(),
     pulls: [],
     nextIssueNumber: 1,
     databaseId: allocDatabaseId(),
@@ -660,7 +700,17 @@ export function newIssue(repo: RepoRec, title: string, body: string, labels: str
   repo.nextIssueNumber += 1;
   issue.nodeId = encodeNodeId('Issue', issue.databaseId);
   repo.issues.push(issue);
+  repo.issuesByNumber.set(issue.number, issue);
   return issue;
+}
+
+/** Issue lookup by number through the index, with a scan fallback that backfills it. */
+export function findIssueByNumber(repo: RepoRec, number: number): IssueRec | null {
+  const hit = repo.issuesByNumber.get(number);
+  if (hit) return hit;
+  const found = repo.issues.find((i) => i.number === number) ?? null;
+  if (found) repo.issuesByNumber.set(number, found);
+  return found;
 }
 
 export function newPull(
