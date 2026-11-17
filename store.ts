@@ -496,8 +496,13 @@ export function inflatePure(input: Buffer): { data: Buffer; consumed: number } {
 // forge state: users, repositories, issues, pulls
 // ---------------------------------------------------------------------------
 
-/** The one viewer every valid bearer token acts as in a trial. */
-export const VIEWER_LOGIN = 'zeee0404';
+/**
+ * The one viewer every valid bearer token acts as in a trial. The trial world
+ * contains exactly one user; the kit fixes that user's login as part of the
+ * contest's published scenario data, and every surface (REST paths, GraphQL
+ * viewer, git URLs) addresses repositories under it.
+ */
+export const VIEWER_LOGIN = 'adaiversen';
 
 let nextDatabaseId = 100000;
 export function allocDatabaseId(): number {
