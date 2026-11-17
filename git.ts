@@ -165,44 +165,105 @@ function sidebandPack(pack: Buffer): Buffer[] {
   return parts;
 }
 
-function packFor(wants: string[], excludeTips: string[], depth: number | null, dropBlobs: boolean): { pack: Buffer; shallow: string[] } {
-  const exclude = reachableSet(excludeTips.filter((t) => hasObject(t)));
+/** Add a commit and its full tree closure (trees + blobs, no parents) to `into`. */
+function addCommitTrees(commitOid: string, into: Set<string>): void {
+  const commit = getObject(commitOid);
+  if (commit?.type !== 'commit') return;
+  into.add(commitOid);
+  const stack = [parseCommit(commit.payload).tree];
+  while (stack.length) {
+    const oid = stack.pop() as string;
+    if (into.has(oid)) continue;
+    const obj = getObject(oid);
+    if (!obj) continue;
+    into.add(oid);
+    if (obj.type === 'tree') {
+      for (const entry of parseTreeEntries(obj.payload)) stack.push(entry);
+    }
+  }
+}
+
+function parseTreeEntries(payload: Buffer): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < payload.length) {
+    const nul = payload.indexOf(0x00, i);
+    if (nul < 0) break;
+    out.push(payload.subarray(nul + 1, nul + 21).toString('hex'));
+    i = nul + 21;
+  }
+  return out;
+}
+
+function packFor(
+  wants: string[],
+  haves: string[],
+  shallowHaves: Set<string>,
+  depth: number | null,
+  dropBlobs: boolean,
+): { pack: Buffer; shallow: string[] } {
+  // What the peer already holds: a shallow have contributes only itself and
+  // its trees (its history is exactly what it does NOT hold); a full have
+  // contributes its whole reachable closure.
+  const exclude = new Set<string>();
+  for (const have of haves) {
+    if (!hasObject(have)) continue;
+    if (shallowHaves.has(have)) addCommitTrees(have, exclude);
+    else for (const oid of reachableSet([have])) exclude.add(oid);
+  }
+  const present = wants.filter((w) => hasObject(w));
+  let objectIds: Set<string>;
   let shallow: string[] = [];
-  let objs: Map<string, { type: never; payload: never }> | ReturnType<typeof collectReachable>;
   if (depth === null) {
-    objs = collectReachable(wants.filter((w) => hasObject(w)), exclude);
+    objectIds = new Set(collectReachable(present, exclude).keys());
   } else {
-    // Depth-limited closure: walk commits by generation, cut at the boundary.
+    // Depth-limited walk over commits: a commit joins the pack when its
+    // shortest distance from a want is below the depth. The shallow boundary
+    // is the set of packed commits with a parent left outside the pack (and
+    // not already held in full by the peer).
+    const distance = new Map<string, number>();
+    const queue: Array<{ oid: string; d: number }> = present.map((w) => ({ oid: w, d: 0 }));
     const included = new Set<string>();
-    const boundary: string[] = [];
-    const seenDepth = new Map<string, number>();
-    const queue: Array<{ oid: string; d: number }> = wants.map((w) => ({ oid: w, d: 0 }));
     while (queue.length) {
       const { oid, d } = queue.shift() as { oid: string; d: number };
-      if (exclude.has(oid)) continue;
-      if (seenDepth.has(oid) && (seenDepth.get(oid) as number) <= d) continue;
-      seenDepth.set(oid, d);
+      if (distance.has(oid) && (distance.get(oid) as number) <= d) continue;
+      distance.set(oid, d);
       const obj = getObject(oid);
-      if (!obj) continue;
-      if (obj.type === 'commit') {
-        if (d >= depth) { boundary.push(oid); continue; }
-        included.add(oid);
-        const c = parseCommit(obj.payload);
-        included.add(c.tree);
-        for (const p of c.parents) queue.push({ oid: p, d: d + 1 });
+      if (obj?.type !== 'commit') continue;
+      if (exclude.has(oid)) {
+        // A shallow have is the deepening frontier: walk through it to its
+        // parents without packing it. A full have ends the walk — the peer
+        // already holds everything below it.
+        if (shallowHaves.has(oid)) {
+          for (const parent of parseCommit(obj.payload).parents) queue.push({ oid: parent, d: d + 1 });
+        }
+        continue;
       }
+      if (d >= depth) continue;
+      included.add(oid);
+      for (const parent of parseCommit(obj.payload).parents) queue.push({ oid: parent, d: d + 1 });
     }
-    // Add the trees/blobs of included commits.
-    const full = collectReachable([...included].filter((o) => getObject(o)?.type === 'commit'), exclude);
-    for (const oid of included) if (full.has(oid)) { /* covered */ }
-    objs = full;
-    shallow = boundary;
+    objectIds = new Set();
+    for (const commitOid of included) {
+      const closure = new Set<string>();
+      addCommitTrees(commitOid, closure);
+      for (const oid of closure) if (!exclude.has(oid)) objectIds.add(oid);
+    }
+    for (const commitOid of included) {
+      const obj = getObject(commitOid);
+      if (obj?.type !== 'commit') continue;
+      const parents = parseCommit(obj.payload).parents;
+      if (parents.some((p) => !included.has(p) && !exclude.has(p))) shallow.push(commitOid);
+    }
   }
-  let map = objs as Map<string, { type: string; payload: Buffer }>;
-  if (dropBlobs) {
-    map = new Map([...map.entries()].filter(([, o]) => o.type !== 'blob'));
+  const objs = new Map<string, { type: string; payload: Buffer }>();
+  for (const oid of objectIds) {
+    const obj = getObject(oid);
+    if (!obj) continue;
+    if (dropBlobs && obj.type === 'blob') continue;
+    objs.set(oid, obj);
   }
-  return { pack: buildPack(map as never), shallow };
+  return { pack: buildPack(objs as never), shallow };
 }
 
 export async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: RepoRec, protocolV2: boolean): Promise<void> {
@@ -225,7 +286,10 @@ export async function handleUploadPack(req: IncomingMessage, res: ServerResponse
       const parts: Buffer[] = [];
       const target = headTarget(repo);
       const headOid = repo.refs.get(target);
-      if (wantSymrefs || headOid || wantUnborn) {
+      // HEAD is listed only when no ref-prefix was given, or a prefix matches
+      // it — a prefix query for refs/heads/ must not see a stray HEAD line.
+      const headMatches = prefixes.length === 0 || prefixes.some((p) => 'HEAD'.startsWith(p));
+      if (headMatches && (wantSymrefs || headOid || wantUnborn)) {
         let line = `${headOid ?? ZERO_OID} HEAD`;
         if (wantSymrefs) line += ` symref-target:${target}`;
         if (!headOid && wantUnborn) line += ' unborn';
@@ -248,6 +312,7 @@ export async function handleUploadPack(req: IncomingMessage, res: ServerResponse
     if (command === 'fetch') {
       const wants = args.filter((a) => a.startsWith('want ')).map((a) => a.slice(5).trim());
       const haves = args.filter((a) => a.startsWith('have ')).map((a) => a.slice(5).trim());
+      const shallowHaves = new Set(args.filter((a) => a.startsWith('shallow ')).map((a) => a.slice(8).trim()));
       const done = args.includes('done');
       const noProgress = args.includes('no-progress');
       const depthLine = args.find((a) => a.startsWith('deepen '));
@@ -273,7 +338,7 @@ export async function handleUploadPack(req: IncomingMessage, res: ServerResponse
         send(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
         return;
       }
-      const { pack, shallow } = packFor(wants, common, depth, dropBlobs);
+      const { pack, shallow } = packFor(wants, haves, shallowHaves, depth, dropBlobs);
       // Sections are separated by a delim, but the response never starts with
       // one: only push a delim when a section already precedes it.
       if (depth !== null) {
@@ -308,7 +373,7 @@ export async function handleUploadPack(req: IncomingMessage, res: ServerResponse
   if (common.length) parts.push(pktLine(`ACK ${common[common.length - 1]}\n`));
   else parts.push(pktLine('NAK\n'));
   if (done || haves.length === 0) {
-    const { pack } = packFor(wants, common, null, false);
+    const { pack } = packFor(wants, haves, new Set(), null, false);
     parts.push(...sidebandPack(pack), PKT_FLUSH);
   }
   send(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));

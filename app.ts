@@ -129,7 +129,9 @@ function pullJson(repo: RepoRec, pull: PullRec): Record<string, unknown> {
     id: pull.databaseId,
     node_id: pull.nodeId,
     number: pull.number,
-    state: pull.state,
+    // The REST API reports a merged pull request as closed (the GraphQL API
+    // has its own MERGED state); `merged` carries the distinction.
+    state: pull.state === 'merged' ? 'closed' : pull.state,
     title: pull.title,
     body: pull.body,
     user: userJson(VIEWER_LOGIN),
@@ -646,7 +648,8 @@ function commitJson(sha: string, message: string, author: string, committer: str
     sha,
     node_id: '',
     commit: {
-      message,
+      // The API presents the message without git's trailing newline.
+      message: message.replace(/\n+$/, ''),
       author: parseIdent(author),
       committer: parseIdent(committer),
       tree: { sha: '' },
@@ -1032,7 +1035,7 @@ export function createApp(): Server {
         const body = await readBody(req);
         let json: Record<string, unknown> | null = null;
         let jsonError = false;
-        if (body.length > 0 && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+        if (body.length > 0 && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')) {
           try {
             const parsedBody: unknown = JSON.parse(body.toString('utf8'));
             json = (parsedBody ?? {}) as Record<string, unknown>;
@@ -1058,7 +1061,7 @@ export function createApp(): Server {
 
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
           if (!hasToken) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
-          if (jsonError && body.length > 0 && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+          if (jsonError && body.length > 0 && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')) {
             // Routes that read JSON answer 400; the handlers also check, but an
             // unknown route with a malformed body is still a JSON 404 in spirit —
             // the protocol checks exercise known routes, so answer 400 here.
